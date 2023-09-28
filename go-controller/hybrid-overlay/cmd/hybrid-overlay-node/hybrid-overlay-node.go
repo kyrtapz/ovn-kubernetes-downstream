@@ -99,6 +99,12 @@ func runHybridOverlay(ctx *cli.Context) error {
 		return fmt.Errorf("missing node name; use the 'node' flag to provide one")
 	}
 
+	wg := &sync.WaitGroup{}
+	if config.Kubernetes.BootstrapKubeconfig != "" {
+		if err := util.StartNodeCertificateManager(ctx.Context, wg, &config.Kubernetes); err != nil {
+			return fmt.Errorf("failed to start the node certificate manager: %w", err)
+		}
+	}
 	clientset, err := util.NewKubernetesClientset(&config.Kubernetes)
 	if err != nil {
 		return err
@@ -121,7 +127,6 @@ func runHybridOverlay(ctx *cli.Context) error {
 	}
 
 	f.Start(stopChan)
-	wg := &sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
