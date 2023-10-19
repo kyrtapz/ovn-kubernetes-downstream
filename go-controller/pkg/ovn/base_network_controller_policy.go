@@ -1428,8 +1428,10 @@ func (bnc *BaseNetworkController) addPeerNamespaceHandler(
 	gress *gressPolicy, np *networkPolicy) error {
 
 	// NetworkPolicy is validated by the apiserver; this can't fail.
-	sel, _ := metav1.LabelSelectorAsSelector(namespaceSelector)
-
+	sel, err := metav1.LabelSelectorAsSelector(namespaceSelector)
+	if err != nil {
+		return err
+	}
 	// start watching namespaces selected by the namespace selector
 	syncFunc := func(objs []interface{}) error {
 		// ignore returned error, since any namespace that wasn't properly handled will be retried individually.
