@@ -28,6 +28,7 @@ import (
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/node/vrfmanager"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/types"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/util"
+	"strings"
 )
 
 const (
@@ -496,6 +497,22 @@ func (udng *UserDefinedNetworkGateway) addUDNManagementPort() (netlink.Link, err
 
 	// STEP1
 	stdout, stderr, err := util.RunOVSVsctl(
+		"--no-heading", "--format=csv", "--data=bare", "--columns=name",
+		"find", "interface", "external-ids:iface-id="+udng.GetNetworkScopedK8sMgmtIntfName(udng.node.Name),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed running find %q interface, stdout: %q, stderr: %q, error: %w",
+			udng.GetNetworkScopedK8sMgmtIntfName(udng.node.Name), stdout, stderr, err)
+	}
+	foundInterfaces := strings.Split(stdout, "\n")
+	if len(foundInterfaces) > 1 {
+		return nil, fmt.Errorf("found more than one interface for the %q management port: %v", udng.GetNetworkScopedK8sMgmtIntfName(udng.node.Name), foundInterfaces)
+	}
+	if len(foundInterfaces) == 1 && foundInterfaces[0] != interfaceName {
+		return nil, fmt.Errorf("%q is already bound to %q instead of %q", udng.GetNetworkScopedK8sMgmtIntfName(udng.node.Name), foundInterfaces[0], interfaceName)
+	}
+
+	stdout, stderr, err = util.RunOVSVsctl(
 		"--", "--may-exist", "add-port", "br-int", interfaceName,
 		"--", "set", "interface", interfaceName, fmt.Sprintf("mac=\"%s\"", macAddr.String()),
 		"type=internal", "mtu_request="+fmt.Sprintf("%d", udng.NetInfo.MTU()),
