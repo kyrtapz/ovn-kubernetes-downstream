@@ -68,7 +68,7 @@ func (p *localPortManager) open(desc string, ip string, port int32, protocol cor
 	if _, exists := p.portsMap[*localPort]; exists {
 		// If the port already exists in the map, we've already opened it.
 		// Don't consider this as an error, since we've reached the desired state.
-		klog.Infof("Svc %s/%s: port %v is already open, no action needed", svc.Namespace, svc.Name, port)
+		klog.V(5).Infof("Svc %s/%s: port %v is already open, no action needed", svc.Namespace, svc.Name, port)
 		return nil
 	} else {
 		closeable, err := p.portOpener.OpenLocalPort(localPort)
