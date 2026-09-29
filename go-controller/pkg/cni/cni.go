@@ -2,9 +2,11 @@ package cni
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	current "github.com/containernetworking/cni/pkg/types/100"
@@ -261,15 +263,10 @@ func (pr *PodRequest) cmdAddWithGetCNIResultFunc(
 			}
 		}
 
-		response.Result, err = getCNIResultFn(pr, clientset, podInterfaceInfo)
+		response.Result, err = getDefaultAndPrimaryUDNCNIResult(getCNIResultFn, clientset, pr, podInterfaceInfo,
+			primaryUDNPodRequest, primaryUDNPodInfo)
 		if err != nil {
 			return nil, err
-		}
-		if primaryUDNPodRequest != nil {
-			err = primaryUDNCmdAddGetCNIResultFunc(response.Result, getCNIResultFn, primaryUDNPodRequest, clientset, primaryUDNPodInfo)
-			if err != nil {
-				return nil, err
-			}
 		}
 	} else {
 		response.PodIFInfo = podInterfaceInfo
@@ -282,27 +279,61 @@ func (pr *PodRequest) cmdAddWithGetCNIResultFunc(
 	return response, nil
 }
 
-func primaryUDNCmdAddGetCNIResultFunc(result *current.Result, getCNIResultFn getCNIResultFunc, primaryUDNPodRequest *PodRequest,
-	clientset PodInfoGetter, primaryUDNPodInfo *PodInterfaceInfo) error {
-	primaryUDNResult, err := getCNIResultFn(primaryUDNPodRequest, clientset, primaryUDNPodInfo)
-	if err != nil {
-		return err
+// getDefaultAndPrimaryUDNCNIResult configures the pod interface described by
+// pr and, when primaryUDNPodRequest is not nil, the primary UDN interface.
+// The two interfaces are independent (separate links, OVS ports and
+// ovn-installed waits), so they are configured concurrently. A failure
+// cancels pr's context, from which primaryUDNPodRequest's is derived, so the
+// other request does not keep waiting.
+func getDefaultAndPrimaryUDNCNIResult(getCNIResultFn getCNIResultFunc, getter PodInfoGetter,
+	pr *PodRequest, podInterfaceInfo *PodInterfaceInfo,
+	primaryUDNPodRequest *PodRequest, primaryUDNPodInfo *PodInterfaceInfo) (*current.Result, error) {
+	if primaryUDNPodRequest == nil {
+		return getCNIResultFn(pr, getter, podInterfaceInfo)
 	}
 
+	var result, primaryUDNResult *current.Result
+	var defaultErr, primaryUDNErr error
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if result, defaultErr = getCNIResultFn(pr, getter, podInterfaceInfo); defaultErr != nil {
+			pr.cancel()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if primaryUDNResult, primaryUDNErr = getCNIResultFn(primaryUDNPodRequest, getter, primaryUDNPodInfo); primaryUDNErr != nil {
+			primaryUDNErr = fmt.Errorf("failed to configure primary UDN interface: %w", primaryUDNErr)
+			pr.cancel()
+		}
+	}()
+	wg.Wait()
+	if defaultErr != nil || primaryUDNErr != nil {
+		return nil, errors.Join(defaultErr, primaryUDNErr)
+	}
+
+	mergePrimaryUDNResult(result, primaryUDNResult)
+	return result, nil
+}
+
+// mergePrimaryUDNResult appends the primary UDN CNI result to the default
+// network one, re-indexing the primary UDN IPs to point at its interfaces.
+func mergePrimaryUDNResult(result, primaryUDNResult *current.Result) {
 	result.Routes = append(result.Routes, primaryUDNResult.Routes...)
 	numOfInitialIPs := len(result.IPs)
 	numOfInitialIfaces := len(result.Interfaces)
 	result.Interfaces = append(result.Interfaces, primaryUDNResult.Interfaces...)
 	result.IPs = append(result.IPs, primaryUDNResult.IPs...)
 
-	// Offset the index of the default network IPs to correctly point to the default network interfaces
+	// Offset the index of the primary UDN IPs to correctly point to the primary UDN interfaces
 	for i := numOfInitialIPs; i < len(result.IPs); i++ {
 		ifaceIPConfig := result.IPs[i].Copy()
 		if result.IPs[i].Interface != nil {
 			result.IPs[i].Interface = current.Int(*ifaceIPConfig.Interface + numOfInitialIfaces)
 		}
 	}
-	return nil
 }
 
 func (pr *PodRequest) cmdDel(clientset *ClientSet) (*Response, error) {

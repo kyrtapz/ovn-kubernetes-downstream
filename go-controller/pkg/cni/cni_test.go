@@ -2,8 +2,10 @@ package cni
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	cnitypes "github.com/containernetworking/cni/pkg/types"
@@ -390,6 +392,82 @@ func dummyPrimaryUDNConfig(ns, nadName string) string {
     }
 `, namespacedName)
 }
+
+var _ = Describe("getDefaultAndPrimaryUDNCNIResult", func() {
+	var (
+		defaultPR, primaryUDNPR *PodRequest
+		defaultInfo, udnInfo    *PodInterfaceInfo
+	)
+
+	resultFor := func(pr *PodRequest) *current.Result {
+		return &current.Result{
+			Interfaces: []*current.Interface{{Name: "host_" + pr.IfName}, {Name: pr.IfName}},
+			IPs:        []*current.IPConfig{{Interface: current.Int(1)}},
+		}
+	}
+
+	BeforeEach(func() {
+		defaultPR = &PodRequest{IfName: "eth0", netName: ovntypes.DefaultNetworkName}
+		// bounds how long a stub may block, so a regression fails instead of hanging
+		defaultPR.ctx, defaultPR.cancel = context.WithTimeout(context.Background(), 10*time.Second)
+		primaryUDNPR = &PodRequest{IfName: "ovn-udn1", netName: "tenantred"}
+		primaryUDNPR.ctx, primaryUDNPR.cancel = context.WithCancel(defaultPR.ctx)
+		defaultInfo = &PodInterfaceInfo{NetName: ovntypes.DefaultNetworkName}
+		udnInfo = &PodInterfaceInfo{NetName: "tenantred"}
+	})
+
+	AfterEach(func() {
+		primaryUDNPR.cancel()
+		defaultPR.cancel()
+	})
+
+	It("configures the default network and the primary UDN concurrently", func() {
+		// Each call waits until both have started; with sequential
+		// configuration the first call would block until its context expires.
+		var started sync.WaitGroup
+		started.Add(2)
+		bothStarted := make(chan struct{})
+		go func() {
+			started.Wait()
+			close(bothStarted)
+		}()
+		getCNIResultFn := func(pr *PodRequest, _ PodInfoGetter, _ *PodInterfaceInfo) (*current.Result, error) {
+			started.Done()
+			select {
+			case <-bothStarted:
+				return resultFor(pr), nil
+			case <-pr.ctx.Done():
+				return nil, fmt.Errorf("%s was not configured concurrently: %w", pr.IfName, pr.ctx.Err())
+			}
+		}
+
+		result, err := getDefaultAndPrimaryUDNCNIResult(getCNIResultFn, nil, defaultPR, defaultInfo, primaryUDNPR, udnInfo)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.Interfaces).To(Equal([]*current.Interface{
+			{Name: "host_eth0"}, {Name: "eth0"}, {Name: "host_ovn-udn1"}, {Name: "ovn-udn1"},
+		}))
+		Expect(result.IPs).To(Equal([]*current.IPConfig{{Interface: current.Int(1)}, {Interface: current.Int(3)}}))
+	})
+
+	DescribeTable("returns the error and aborts the other request",
+		func(failingIfName string) {
+			errBoom := errors.New("boom")
+			getCNIResultFn := func(pr *PodRequest, _ PodInfoGetter, _ *PodInterfaceInfo) (*current.Result, error) {
+				if pr.IfName == failingIfName {
+					return nil, errBoom
+				}
+				<-pr.ctx.Done()
+				return nil, pr.ctx.Err()
+			}
+
+			_, err := getDefaultAndPrimaryUDNCNIResult(getCNIResultFn, nil, defaultPR, defaultInfo, primaryUDNPR, udnInfo)
+			Expect(err).To(MatchError(errBoom))
+			Expect(defaultPR.ctx.Err()).To(MatchError(context.Canceled), "the request should be cancelled, not timed out")
+		},
+		Entry("when the default network fails", "eth0"),
+		Entry("when the primary UDN fails", "ovn-udn1"),
+	)
+})
 
 var _ = Describe("checkBridgeMapping", func() {
 	const networkName = "test-network"

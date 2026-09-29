@@ -262,22 +262,19 @@ func (p *Plugin) CmdAdd(args *skel.CmdArgs) error {
 			}
 		}
 
+		var primaryUDNPodRequest *PodRequest
+		if response.PrimaryUDNPodInfo != nil {
+			primaryUDNPodRequest = response.PrimaryUDNPodReq
+			primaryUDNPodRequest.ctx, primaryUDNPodRequest.cancel = context.WithCancel(pr.ctx)
+			defer primaryUDNPodRequest.cancel()
+		}
 		// In the case where ovnkube-node is running in Unprivileged mode, all the work
-		result, err = getCNIResult(pr, clientset, response.PodIFInfo)
+		result, err = getDefaultAndPrimaryUDNCNIResult(getCNIResult, clientset, pr, response.PodIFInfo,
+			primaryUDNPodRequest, response.PrimaryUDNPodInfo)
 		if err != nil {
 			err = fmt.Errorf("failed to get CNI Result from pod interface info %v: %v", response.PodIFInfo, err)
 			klog.Error(err.Error())
 			return err
-		}
-		if response.PrimaryUDNPodInfo != nil {
-			primaryUDNPodRequest := response.PrimaryUDNPodReq
-			primaryUDNPodRequest.ctx, primaryUDNPodRequest.cancel = context.WithCancel(pr.ctx)
-			defer primaryUDNPodRequest.cancel()
-			err = primaryUDNCmdAddGetCNIResultFunc(result, getCNIResult, primaryUDNPodRequest, clientset, response.PrimaryUDNPodInfo)
-			if err != nil {
-				klog.Error(err.Error())
-				return err
-			}
 		}
 	}
 
