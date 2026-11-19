@@ -23,6 +23,9 @@ import (
 	knet "k8s.io/utils/net"
 	"k8s.io/utils/ptr"
 
+	libovsdbclient "github.com/ovn-kubernetes/libovsdb/client"
+
+	ovncnitypes "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/cni/types"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/factory"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/kubevirt"
@@ -87,6 +90,40 @@ var _ = Describe("OVN Multi-Homed pod operations for layer 2 network", func() {
 
 	AfterEach(func() {
 		fakeOvn.shutdown()
+	})
+
+	It("moves a MAC-VRF switch from the host port to native EVPN", func() {
+		config.Gateway.Mode = config.GatewayModeShared
+		netInfo := dummyPrimaryLayer2EVPNCUDN("100.200.0.0/16")
+		netInfo.evpn = &ovncnitypes.EVPNConfig{
+			VTEP: "fabric", MACVRF: &ovncnitypes.VRFConfig{VNI: 20100, VID: 2},
+		}
+		network, err := util.NewNetInfo(netInfo.netconf())
+		Expect(err).NotTo(HaveOccurred())
+		switchName := network.GetNetworkScopedSwitchName("")
+		legacyPort := &nbdb.LogicalSwitchPort{Name: util.GetMACVRFPortName(switchName), UUID: "legacy-evpn-port"}
+		initialDB.NBData = append(initialDB.NBData, legacyPort, &nbdb.LogicalSwitch{
+			Name: switchName, Ports: []string{legacyPort.UUID},
+		})
+		testNode, err := newNodeWithUserDefinedNetworks(nodeName, "192.168.126.202/24")
+		Expect(err).NotTo(HaveOccurred())
+		nodes := []corev1.Node{*testNode}
+		nodeIPs, _, err := buildClusterNodeIPsAddressSetsForNodes(nodes)
+		Expect(err).NotTo(HaveOccurred())
+		enabledSvcIPs, _ := buildUDNEnabledSvcAddressSets(nil)
+		initialDB.NBData = append(initialDB.NBData, nodeIPs, enabledSvcIPs)
+		podInfo := dummyL2TestPod(ns, netInfo, 0, 0)
+		pod := newMultiHomedPod(podInfo, netInfo)
+		Expect(setupFakeOvnForLayer2Topology(fakeOvn, initialDB, netInfo, nodes, podInfo, pod)).To(Succeed())
+		DeferCleanup(fakeOvn.networkManager.Stop)
+
+		sw, err := libovsdbops.GetLogicalSwitch(fakeOvn.nbClient, &nbdb.LogicalSwitch{Name: switchName})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(sw.OtherConfig).To(HaveKeyWithValue("dynamic-routing-vni", "20100"))
+		Expect(sw.OtherConfig).To(HaveKeyWithValue("dynamic-routing-vxlan-ifname", "evx4-fabric,evx6-fabric"))
+		Expect(sw.OtherConfig).To(HaveKeyWithValue(dynamicRoutingRedistribute, "fdb,ip"))
+		_, err = libovsdbops.GetLogicalSwitchPort(fakeOvn.nbClient, legacyPort)
+		Expect(err).To(MatchError(libovsdbclient.ErrNotFound))
 	})
 
 	DescribeTable(

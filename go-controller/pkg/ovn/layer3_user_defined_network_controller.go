@@ -1146,12 +1146,19 @@ func (oc *Layer3UserDefinedNetworkController) syncNodes(_ context.Context, nodes
 	if err != nil {
 		return fmt.Errorf("failed to get node logical switches which have other-config set for network %s: %v", oc.GetNetworkName(), err)
 	}
+	staleNodes := sets.New[string]()
 	for _, nodeSwitch := range nodeSwitches {
-		nodeName := oc.RemoveNetworkScopeFromName(nodeSwitch.Name)
+		nodeName := nodeSwitch.ExternalIDs[types.NodeExternalID]
+		if nodeName == "" {
+			nodeName = oc.RemoveNetworkScopeFromName(nodeSwitch.Name)
+		}
 		if !foundNodes.Has(nodeName) {
-			if err := oc.deleteNode(nodeName); err != nil {
-				return fmt.Errorf("failed to delete node:%s, err:%v", nodeName, err)
-			}
+			staleNodes.Insert(nodeName)
+		}
+	}
+	for nodeName := range staleNodes {
+		if err := oc.deleteNode(nodeName); err != nil {
+			return fmt.Errorf("failed to delete node:%s, err:%v", nodeName, err)
 		}
 	}
 

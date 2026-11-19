@@ -206,7 +206,7 @@ func (c *Controller) initialSync() error {
 	activeVTEPs := sets.New[string]()
 	for _, vtep := range vteps {
 		activeVTEPs.Insert(vtep.Name)
-		if vtep.Spec.Mode == vtepv1.VTEPModeManaged {
+		if vtep.Spec.Mode == vtepv1.VTEPModeManaged || hybridOverlayVXLANConflict() {
 			continue
 		}
 		vtepIPv4, vtepIPv6, err := c.discoverUnmanagedVTEPIPs(vtep)
@@ -227,6 +227,10 @@ func (c *Controller) initialSync() error {
 	// directly through libovsdb and need explicit cleanup here.
 	if err := c.cleanupStaleOVSPorts(activeVTEPs); err != nil {
 		klog.Errorf("Failed to clean up stale OVS ports: %v", err)
+	}
+
+	if err := c.syncNativeEVPN(); err != nil {
+		return err
 	}
 
 	if err := c.cleanStalePodEntries(); err != nil {
@@ -261,8 +265,8 @@ func (c *Controller) vtepNeedsUpdate(oldObj, newObj *vtepv1.VTEP) bool {
 	return !reflect.DeepEqual(oldObj.Spec, newObj.Spec)
 }
 
-// onNodeUpdate enqueues local VTEP annotation repair regardless of the
-// client-supplied field-manager identity.
+// onNodeUpdate requeues VTEPs when their annotated IPs or the shared gateway
+// MAC change.
 func (c *Controller) onNodeUpdate(oldObj, newObj interface{}) {
 	oldNode, ok := oldObj.(*corev1.Node)
 	if !ok {
@@ -275,7 +279,8 @@ func (c *Controller) onNodeUpdate(oldObj, newObj interface{}) {
 	if newNode.Name != c.nodeName {
 		return
 	}
-	if !util.NodeVTEPsAnnotationChanged(oldNode, newNode) {
+	if !util.NodeVTEPsAnnotationChanged(oldNode, newNode) &&
+		!(config.Gateway.Mode == config.GatewayModeShared && util.NodeL3GatewayAnnotationChanged(oldNode, newNode)) {
 		return
 	}
 	// Field-manager names are client supplied. Reconcile every changed value;
@@ -344,7 +349,10 @@ func (c *Controller) reconcile(_ context.Context, key string) error {
 			if err := c.deleteVTEPDevices(key); err != nil {
 				return err
 			}
-			return c.setVTEPAnnotation(key, nil, nil)
+			if err := c.setVTEPAnnotation(key, nil, nil); err != nil {
+				return err
+			}
+			return c.syncNativeEVPN()
 		}
 		return err
 	}
@@ -353,12 +361,15 @@ func (c *Controller) reconcile(_ context.Context, key string) error {
 		if err := c.deleteVTEPDevices(key); err != nil {
 			return err
 		}
-		return c.setVTEPAnnotation(key, nil, nil)
+		if err := c.setVTEPAnnotation(key, nil, nil); err != nil {
+			return err
+		}
+		return c.syncNativeEVPN()
 	}
 
-	if config.HybridOverlay.Enabled && config.HybridOverlay.VXLANPort == config.DefaultVXLANPort {
+	if hybridOverlayVXLANConflict() {
 		return fmt.Errorf("hybrid overlay is enabled with VXLAN port %d which conflicts with EVPN VXLAN; "+
-			"configure a different hybrid-overlay-vxlan-port to avoid the conflict", config.DefaultVXLANPort)
+			"configure a different hybrid-overlay-vxlan-port to avoid the conflict", config.HybridOverlay.VXLANPort)
 	}
 
 	vtepIPv4, vtepIPv6, err := c.discoverUnmanagedVTEPIPs(vtep)
@@ -367,12 +378,20 @@ func (c *Controller) reconcile(_ context.Context, key string) error {
 	}
 	if vtepIPv4 == nil && vtepIPv6 == nil {
 		klog.Infof("VTEP %s IPs not yet available for node %s", vtep.Name, c.nodeName)
-		return c.deleteVTEPDevices(key)
+		if err := c.deleteVTEPDevices(key); err != nil {
+			return err
+		}
+		return c.syncNativeEVPN()
 	}
 
 	networks, err := c.ensureDevices(vtep, vtepIPv4, vtepIPv6)
 	if err != nil {
 		return err
+	}
+	if config.Gateway.Mode == config.GatewayModeShared {
+		if err := c.syncNativeEVPN(); err != nil {
+			return err
+		}
 	}
 
 	if err := c.reconcileOVSPorts(vtep.Name, GetEVPNBridgeName(vtep.Name), networks); err != nil {
@@ -536,13 +555,27 @@ func (c *Controller) getVIDVNIMappings(networks []evpnNetworkInfo) []netlinkdevi
 // and L2VNI-to-VRF association. Tracks created SVIs in svisByBridge to detect
 // stale ones.
 func (c *Controller) reconcileSVIs(bridgeName string, networks []evpnNetworkInfo) error {
+	var l3SVIMAC net.HardwareAddr
+	if config.Gateway.Mode == config.GatewayModeShared && slices.ContainsFunc(networks, func(network evpnNetworkInfo) bool {
+		return network.ipVRFVID != 0
+	}) {
+		node, err := c.watchFactory.GetNode(c.nodeName)
+		if err != nil {
+			return err
+		}
+		gateway, err := util.ParseNodeL3GatewayAnnotation(node)
+		if err != nil {
+			return err
+		}
+		l3SVIMAC = gateway.MACAddress
+	}
 	desiredSVIs := sets.New[string]()
 	for _, net := range networks {
 		if net.ipVRFVID != 0 {
 			desiredSVIs.Insert(net.l3SVIName)
 			if err := c.ndm.EnsureLink(netlinkdevicemanager.DeviceConfig{
 				Link: &netlink.Vlan{
-					LinkAttrs: netlink.LinkAttrs{Name: net.l3SVIName},
+					LinkAttrs: netlink.LinkAttrs{Name: net.l3SVIName, HardwareAddr: l3SVIMAC},
 					VlanId:    net.ipVRFVID,
 				},
 				VLANParent: bridgeName,
@@ -612,13 +645,16 @@ func (c *Controller) reconcileOVSPorts(vtepName, bridgeName string, networks []e
 	return nil
 }
 
-// ensureOVSPort creates an OVS internal port on br-int, attaches it to the EVPN bridge, and sets VLAN access.
-// The iface-id on the Interface external_ids is set to macVRFLSPName so that ovn-controller can bind the
-// corresponding MAC-VRF logical switch port to this OVS port.
+// ensureOVSPort creates an OVS internal port for the host bridge FDB. Local
+// gateway mode also binds it to a logical port to forward packets via Linux.
 func (c *Controller) ensureOVSPort(vtepName, bridgeName, portName, macVRFLSPName string, vid int) error {
+	var ifaceIDs map[string]string
+	if config.Gateway.Mode != config.GatewayModeShared {
+		ifaceIDs = map[string]string{"iface-id": macVRFLSPName}
+	}
 	if err := libovsdbops.CreateOrUpdatePortWithInterface(c.ovsClient, ovsBridgeInt, portName,
 		map[string]string{types.EVPNVTEPExternalID: vtepName},
-		map[string]string{"iface-id": macVRFLSPName}); err != nil {
+		ifaceIDs); err != nil {
 		return fmt.Errorf("failed to create OVS port %s: %w", portName, err)
 	}
 
@@ -721,7 +757,7 @@ func (c *Controller) ensureVXLAN(vxlanName string, bridgeName string, srcIP net.
 	err := c.ndm.EnsureLink(netlinkdevicemanager.DeviceConfig{
 		Link: &netlink.Vxlan{
 			LinkAttrs: netlink.LinkAttrs{Name: vxlanName, MTU: config.Default.MTU},
-			Port:      config.DefaultVXLANPort,
+			Port:      hostVXLANPort(),
 			SrcAddr:   srcIP,
 			// FlowBased (ip link: external): destination VTEP is resolved per-flow from the FDB, populated by FRR via BGP EV
 			FlowBased: true,

@@ -51,6 +51,7 @@ type userDefinedNetInfo struct {
 	allowPersistentIPs bool
 	ipamClaimReference string
 	hasEVPN            bool
+	evpn               *ovncnitypes.EVPNConfig
 	transport          string // e.g., types.NetworkTransportNoOverlay
 	outboundSNAT       string // e.g., types.NoOverlaySNATEnabled
 }
@@ -1776,6 +1777,7 @@ func (sni *userDefinedNetInfo) netconf() *ovncnitypes.NetConf {
 
 	if sni.hasEVPN {
 		netconf.Transport = types.NetworkTransportEVPN
+		netconf.EVPN = sni.evpn
 	}
 	if sni.transport != "" {
 		netconf.Transport = sni.transport

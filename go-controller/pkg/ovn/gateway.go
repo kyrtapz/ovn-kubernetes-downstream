@@ -285,7 +285,7 @@ func (gw *GatewayManager) cleanupStalePodSNATs(nodeName string, nodeIPs []*net.I
 	return nil
 }
 
-func (gw *GatewayManager) createGWRouter(gwConfig *GatewayConfig) (*nbdb.LogicalRouter, error) {
+func (gw *GatewayManager) createGWRouter(gwConfig *GatewayConfig, evpnTableID string) (*nbdb.LogicalRouter, error) {
 	// Create a gateway router.
 	logicalRouterOptions := map[string]string{
 		"always_learn_from_arp_request": "false",
@@ -293,6 +293,9 @@ func (gw *GatewayManager) createGWRouter(gwConfig *GatewayConfig) (*nbdb.Logical
 		"chassis":                       gwConfig.annoConfig.ChassisID,
 		"lb_force_snat_ip":              "router_ip",
 		"mac_binding_age_threshold":     types.GRMACBindingAgeThreshold,
+	}
+	if evpnTableID != "" {
+		maps.Copy(logicalRouterOptions, nativeEVPNRouterOptions(gw.netInfo, evpnTableID))
 	}
 	// set the snat-ct-zone only for the default network
 	// for UDN's OVN will pick a random one
@@ -408,6 +411,9 @@ func (gw *GatewayManager) createGWRouterPeerSwitchPort(nodeName string) error {
 				nodeName, gw.netInfo.GetNetworkName(), err)
 		}
 		logicalSwitchPort.Options[libovsdbops.RequestedTnlKey] = strconv.Itoa(tunnelID)
+		if util.UsesOVNNativeEVPN(gw.netInfo) {
+			logicalSwitchPort.Options[dynamicRoutingAdvertise] = "false"
+		}
 	}
 	sw := nbdb.LogicalSwitch{Name: gw.joinSwitchName}
 	err := libovsdbops.CreateOrUpdateLogicalSwitchPortsOnSwitch(gw.nbClient, &sw, &logicalSwitchPort)
@@ -1328,7 +1334,14 @@ func (gw *GatewayManager) gatewayInit(
 		}
 	}
 
-	gwRouter, err := gw.createGWRouter(gwConfig)
+	var evpnTableID string
+	if gw.usesNativeIPVRF() {
+		evpnTableID, err = gw.nativeEVPNTableID()
+		if err != nil {
+			return err
+		}
+	}
+	gwRouter, err := gw.createGWRouter(gwConfig, evpnTableID)
 	if err != nil {
 		return err
 	}
@@ -1366,6 +1379,12 @@ func (gw *GatewayManager) gatewayInit(
 			gwConfig.annoConfig.EgressGWIPAddresses,
 			nil); err != nil {
 			return err
+		}
+	}
+
+	if gw.netInfo.TopologyType() == types.Layer3Topology && gw.netInfo.Transport() == types.NetworkTransportEVPN {
+		if err := gw.syncIPVRFSwitch(gwRouter, gwConfig.annoConfig.MACAddress, evpnTableID); err != nil {
+			return fmt.Errorf("failed to reconcile EVPN IP-VRF on gateway router %s: %w", gwRouter.Name, err)
 		}
 	}
 
@@ -1754,6 +1773,11 @@ func (gw *GatewayManager) Cleanup() error {
 	err = libovsdbops.DeleteLogicalRouter(gw.nbClient, &logicalRouter)
 	if err != nil && !errors.Is(err, libovsdbclient.ErrNotFound) {
 		return fmt.Errorf("failed to delete gateway router %s: %w", gw.gwRouterName, err)
+	}
+	if gw.netInfo.TopologyType() == types.Layer3Topology && gw.netInfo.Transport() == types.NetworkTransportEVPN {
+		if err := libovsdbops.DeleteLogicalSwitch(gw.nbClient, gw.evpnSwitchName()); err != nil {
+			return fmt.Errorf("failed to delete EVPN switch for gateway router %s: %w", gw.gwRouterName, err)
+		}
 	}
 
 	// Remove external switch

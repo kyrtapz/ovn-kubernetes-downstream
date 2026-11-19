@@ -515,6 +515,13 @@ func (bnc *BaseNetworkController) syncNodeClusterRouterPort(node *corev1.Node, h
 		}
 		lrpOptions[libovsdbops.RequestedTnlKey] = strconv.Itoa(transitRouterToSwitchTunnelKey)
 	}
+	if bnc.TopologyType() == types.Layer3Topology && util.UsesOVNNativeEVPN(bnc) {
+		if lrpOptions == nil {
+			lrpOptions = make(map[string]string)
+		}
+		// Advertise the workload subnet from its chassis-bound port.
+		lrpOptions[dynamicRoutingRedistribute] = "connected"
+	}
 	logicalRouterPort := nbdb.LogicalRouterPort{
 		Name:     lrpName,
 		MAC:      nodeLRPMAC.String(),
@@ -869,6 +876,11 @@ func (bnc *BaseNetworkController) syncNodeManagementPort(node *corev1.Node, swit
 	logicalSwitchPort := nbdb.LogicalSwitchPort{
 		Name:      bnc.GetNetworkScopedK8sMgmtIntfName(node.Name),
 		Addresses: []string{addresses},
+	}
+	if bnc.TopologyType() == types.Layer2Topology && util.UsesOVNNativeEVPN(bnc) {
+		// Management addresses belong to the local node even when the
+		// workload switch is extended over EVPN.
+		logicalSwitchPort.Options = map[string]string{dynamicRoutingAdvertise: "false"}
 	}
 	sw := nbdb.LogicalSwitch{Name: switchName}
 	err = libovsdbops.CreateOrUpdateLogicalSwitchPortsOnSwitch(bnc.nbClient, &sw, &logicalSwitchPort)

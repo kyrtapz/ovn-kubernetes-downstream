@@ -1255,6 +1255,9 @@ func (oc *Layer2UserDefinedNetworkController) syncClusterRouterPorts(node *corev
 			types.TopologyExternalID: oc.TopologyType(),
 		},
 	}
+	if util.UsesOVNNativeEVPN(oc) {
+		logicalSwitchPort.Options[dynamicRoutingAdvertise] = "false"
+	}
 	sw := nbdb.LogicalSwitch{Name: switchName}
 	err := libovsdbops.CreateOrUpdateLogicalSwitchPortsOnSwitch(oc.nbClient, &sw, &logicalSwitchPort)
 	if err != nil {

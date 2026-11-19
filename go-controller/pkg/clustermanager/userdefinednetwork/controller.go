@@ -86,7 +86,7 @@ func ipVRFKey(networkName string) string {
 	return networkName + "/ipvrf"
 }
 
-// vniKey identifies a VNI within a VTEP scope. VNIs must be unique per VTEP.
+// vniKey identifies a VNI within a VTEP, or across all VTEPs for native EVPN.
 type vniKey struct {
 	vtep string
 	vni  int32
@@ -523,20 +523,28 @@ func (c *Controller) releaseEVPNIDsForNetwork(networkName string) {
 	c.releaseVNIs(networkName)
 }
 
-// reserveVNIs reserves VNIs for a network within a VTEP scope, ensuring no two
-// networks sharing the same VTEP use the same VNI.
+// reserveVNIs reserves a network's VNIs in the scope used by the datapath.
 func (c *Controller) reserveVNIs(networkName, vtepName string, macVRFVNI, ipVRFVNI int32) error {
 	c.reservedVNIsLock.Lock()
 	defer c.reservedVNIsLock.Unlock()
 
 	var errs []error
+	scope := vtepName
+	if config.Gateway.Mode == config.GatewayModeShared {
+		// OVN indexes the local tunnel source and EVPN datapaths by VNI.
+		scope = ""
+	}
 	for _, vni := range []int32{macVRFVNI, ipVRFVNI} {
 		if vni == 0 {
 			continue
 		}
-		key := vniKey{vtep: vtepName, vni: vni}
+		key := vniKey{vtep: scope, vni: vni}
 		if owner, exists := c.reservedVNIs[key]; exists && owner != networkName {
-			errs = append(errs, fmt.Errorf("VNI %d on VTEP %q is already reserved by network %q", vni, vtepName, owner))
+			if scope == "" {
+				errs = append(errs, fmt.Errorf("VNI %d is already reserved by network %q", vni, owner))
+			} else {
+				errs = append(errs, fmt.Errorf("VNI %d on VTEP %q is already reserved by network %q", vni, vtepName, owner))
+			}
 			continue
 		}
 		c.reservedVNIs[key] = networkName
@@ -1348,9 +1356,6 @@ func (c *Controller) validateEVPN(cudn *userdefinednetworkv1.ClusterUserDefinedN
 
 	if !config.OVNKubernetesFeature.EnableEVPN {
 		return &evpnConfigError{msg: "EVPN transport requested but EVPN feature is not enabled"}
-	}
-	if config.Gateway.Mode != config.GatewayModeLocal {
-		return &evpnConfigError{msg: "EVPN transport requested but EVPN feature is only supported in local gateway mode"}
 	}
 
 	return c.validateVTEP(cudn)

@@ -464,6 +464,11 @@ func (c *controller) getBGPRoutes(table int, ignoreSubnets []*net.IPNet, routeLi
 // selected Uplink bridge, so BGP routes learned or leaked through other
 // interfaces cannot be installed into OVN for that network.
 func (c *controller) getRouteLinkIndexFilter(network util.NetInfo) (int, error) {
+	if util.UsesOVNNativeEVPN(network) && network.TopologyType() == types.Layer3Topology {
+		// OVN learns these routes on the IP-VRF port. A static route via
+		// the physical gateway port would direct traffic away from EVPN.
+		return noRouteLinkIndex, nil
+	}
 	uplinkName := network.Uplink()
 	if uplinkName == "" {
 		return 0, nil

@@ -206,6 +206,9 @@ func (oc *BaseLayer2UserDefinedNetworkController) initializeLogicalSwitch(switch
 		logicalSwitch.OtherConfig["mcast_snoop"] = "true"
 		logicalSwitch.OtherConfig["mcast_flood_unregistered"] = "true"
 		logicalSwitch.OtherConfig["mcast_querier"] = "false"
+		if util.UsesOVNNativeEVPN(oc) {
+			break
+		}
 		// connect the switch to the EVPN macvrf
 		macvrfportName := util.GetMACVRFPortName(switchName)
 		macvrfport := &nbdb.LogicalSwitchPort{
@@ -258,6 +261,12 @@ func (oc *BaseLayer2UserDefinedNetworkController) initializeLogicalSwitch(switch
 	_, err = libovsdbops.TransactAndCheckAndSetUUIDs(oc.nbClient, lsps, ops)
 	if err != nil {
 		return nil, fmt.Errorf("failed to transact logical switch operations: %w", err)
+	}
+
+	if oc.Transport() == types.NetworkTransportEVPN {
+		if err := oc.syncMACVRFSwitch(&logicalSwitch); err != nil {
+			return nil, fmt.Errorf("failed to reconcile EVPN settings on %s: %w", switchName, err)
+		}
 	}
 
 	if err = oc.lsManager.AddOrUpdateSwitch(switchName, hostSubnets, reservedSubnets, nil, excludeSubnets...); err != nil {

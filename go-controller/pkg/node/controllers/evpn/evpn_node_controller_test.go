@@ -38,6 +38,7 @@ import (
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/kube"
 	kubemocks "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/kube/mocks"
 	libovsdbops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
+	ovsops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops/ovs"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/networkmanager"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/node/netlinkdevicemanager"
 	ndmmocks "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/node/netlinkdevicemanager/mocks"
@@ -71,6 +72,58 @@ var _ = Describe("EVPN node controller", func() {
 		nodeName = "node1"
 		vtepName = "vtep1"
 	)
+
+	It("reconciles native OVN tunnel sources per VNI and removes stale endpoints", func() {
+		Expect(config.PrepareTestConfig()).To(Succeed())
+		config.Gateway.Mode = config.GatewayModeShared
+		ovsClient, cleanup := newTestOVSClient()
+		DeferCleanup(cleanup.Cleanup)
+		Expect(libovsdbops.UpdateOpenvSwitchExternalIDs(ovsClient, map[string]string{"ovn-encap-ip": "192.0.2.1"})).To(Succeed())
+
+		vtep := &vtepv1.VTEP{
+			ObjectMeta: metav1.ObjectMeta{Name: vtepName},
+			Spec:       vtepv1.VTEPSpec{Mode: vtepv1.VTEPModeUnmanaged},
+		}
+		lister := &vteplistmocks.VTEPLister{}
+		lister.On("List", mock.Anything).Return([]*vtepv1.VTEP{vtep}, nil)
+		informer := &vtepinfmocks.VTEPInformer{}
+		informer.On("Lister").Return(lister)
+		wf := &factorymocks.NodeWatchFactory{}
+		wf.On("VTEPInformer").Return(informer)
+		network := &multinetworkmocks.NetInfo{}
+		network.On("EVPNVTEPName").Return(vtepName)
+		network.On("EVPNMACVRFVNI").Return(int32(20100))
+		network.On("EVPNIPVRFVNI").Return(int32(0))
+		nm := &networkmanager.FakeNetworkManager{
+			PrimaryNetworks: map[string]util.NetInfo{"ns1": network, "ns2": network},
+		}
+		ndm := &ndmmocks.Interface{}
+		ndm.On("EnsureLink", mock.MatchedBy(func(cfg netlinkdevicemanager.DeviceConfig) bool {
+			link, ok := cfg.Link.(*netlink.Vxlan)
+			return ok && link.Port == 64789
+		})).Return(nil).Once()
+		ctrl := &Controller{
+			watchFactory: wf, ovsClient: ovsClient, networkMgr: nm, ndm: ndm,
+			vtepsAnnotation: map[string]util.VTEPNodeAnnotation{
+				vtepName: {IPs: []string{"192.0.2.2", "2001:db8::2"}},
+			},
+		}
+
+		Expect(ctrl.ensureVXLAN(GetEVPNVXLANName(vtepName, utilnet.IPv4), GetEVPNBridgeName(vtepName),
+			net.ParseIP("192.0.2.2"), nil)).To(Succeed())
+		ndm.AssertExpectations(GinkgoT())
+		Expect(ctrl.syncNativeEVPN()).To(Succeed())
+		ovs, err := ovsops.GetOpenvSwitch(ovsClient)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ovs.ExternalIDs).To(HaveKeyWithValue("ovn-evpn-local-ip", "20100-192.0.2.2,20100-2001:db8::2"))
+		Expect(ovs.ExternalIDs).To(HaveKeyWithValue("ovn-evpn-vxlan-ports", "4789"))
+
+		delete(ctrl.vtepsAnnotation, vtepName)
+		Expect(ctrl.syncNativeEVPN()).To(Succeed())
+		ovs, err = ovsops.GetOpenvSwitch(ovsClient)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ovs.ExternalIDs).To(Equal(map[string]string{"ovn-encap-ip": "192.0.2.1"}))
+	})
 
 	Describe("reconcile", func() {
 		var (

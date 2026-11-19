@@ -2114,7 +2114,12 @@ func IsRouteAdvertisementsEnabled() bool {
 }
 
 func IsEVPNEnabled() bool {
-	return IsRouteAdvertisementsEnabled() && config.Gateway.Mode == config.GatewayModeLocal && config.OVNKubernetesFeature.EnableEVPN
+	return IsRouteAdvertisementsEnabled() && config.OVNKubernetesFeature.EnableEVPN
+}
+
+// UsesOVNNativeEVPN reports whether OVN forwards EVPN traffic in br-int.
+func UsesOVNNativeEVPN(netInfo NetInfo) bool {
+	return config.Gateway.Mode == config.GatewayModeShared && netInfo.Transport() == types.NetworkTransportEVPN
 }
 
 // IsPreconfiguredUDNAddressesEnabled indicates if user defined IPs / MAC

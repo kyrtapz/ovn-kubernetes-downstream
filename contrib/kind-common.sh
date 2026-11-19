@@ -256,10 +256,6 @@ set_common_default_params() {
     echo "EVPN requires Route advertisements to be enabled (-rae)"
     exit 1
   fi
-  if [ "$ENABLE_EVPN" == true ] && [ "$OVN_GATEWAY_MODE" != "local" ]; then
-    echo "EVPN requires local gateway mode (-gm local)"
-    exit 1
-  fi
   if [ "$OVN_UPLINK_BRIDGE" == true ] && [ "${DPU_MODE:-none}" != "none" ]; then
     echo "Uplink bridge provisioning is supported only for regular KIND deployments"
     exit 1
