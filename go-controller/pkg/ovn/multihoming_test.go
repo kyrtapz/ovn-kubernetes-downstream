@@ -13,11 +13,13 @@ import (
 	kubevirtv1 "kubevirt.io/api/core/v1"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
 	libovsdbops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/nbdb"
 	addressset "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/address_set"
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/addresssetmanager"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/ovn/controller/udnenabledsvc"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/testing"
 	libovsdbtest "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/testing/libovsdb"
@@ -268,6 +270,13 @@ func (em *userDefinedNetworkExpectationMachine) expectedLogicalSwitchesAndPortsW
 					acl.UUID = "DenyARPAndNSOnMACVRF-UUID"
 					data = append(data, acl)
 					acls[switchName] = append(acls[switchName], acl.UUID)
+					ids := addresssetmanager.GetPodSelectorAddrSetDbIDs(&metav1.LabelSelector{}, &metav1.LabelSelector{}, nil, "", ocInfo.bnc.controllerName, true)
+					v4, _ := addressset.GetHashNamesForAS(ids)
+					for _, transitACL := range macVRFTransitACLs(ocInfo.bnc.controllerName, macvrfPortName, v4, "") {
+						transitACL.UUID = "transit-" + transitACL.Direction + "-UUID"
+						data = append(data, transitACL)
+						acls[switchName] = append(acls[switchName], transitACL.UUID)
+					}
 				}
 			}
 

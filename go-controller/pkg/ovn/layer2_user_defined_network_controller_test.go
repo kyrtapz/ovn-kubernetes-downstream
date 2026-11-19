@@ -102,8 +102,11 @@ var _ = Describe("OVN Multi-Homed pod operations for layer 2 network", func() {
 		Expect(err).NotTo(HaveOccurred())
 		switchName := network.GetNetworkScopedSwitchName("")
 		legacyPort := &nbdb.LogicalSwitchPort{Name: util.GetMACVRFPortName(switchName), UUID: "legacy-evpn-port"}
-		initialDB.NBData = append(initialDB.NBData, legacyPort, &nbdb.LogicalSwitch{
-			Name: switchName, Ports: []string{legacyPort.UUID},
+		legacyACLs := macVRFTransitACLs(getNetworkControllerName(network.GetNetworkName()), legacyPort.Name, "legacyPods", "")
+		legacyACLs[0].UUID, legacyACLs[1].UUID = "legacy-transit-to", "legacy-transit-from"
+		unrelatedACL := &nbdb.ACL{UUID: "other-acl", Direction: nbdb.ACLDirectionToLport, Priority: 1000, Match: "ip4.mcast", Action: nbdb.ACLActionDrop}
+		initialDB.NBData = append(initialDB.NBData, legacyPort, legacyACLs[0], legacyACLs[1], unrelatedACL, &nbdb.LogicalSwitch{
+			Name: switchName, Ports: []string{legacyPort.UUID}, ACLs: []string{legacyACLs[0].UUID, legacyACLs[1].UUID, unrelatedACL.UUID},
 		})
 		testNode, err := newNodeWithUserDefinedNetworks(nodeName, "192.168.126.202/24")
 		Expect(err).NotTo(HaveOccurred())
@@ -120,6 +123,13 @@ var _ = Describe("OVN Multi-Homed pod operations for layer 2 network", func() {
 		sw, err := libovsdbops.GetLogicalSwitch(fakeOvn.nbClient, &nbdb.LogicalSwitch{Name: switchName})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(sw.OtherConfig).To(HaveKeyWithValue("dynamic-routing-vni", "20100"))
+		remaining, err := libovsdbops.FindACLsWithPredicate(fakeOvn.nbClient, libovsdbops.GetPredicate[*nbdb.ACL](macVRFTransitACLIDs(getNetworkControllerName(network.GetNetworkName())), nil))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(remaining).To(BeEmpty())
+		kept, err := libovsdbops.FindACLsWithPredicate(fakeOvn.nbClient, func(acl *nbdb.ACL) bool { return acl.Match == unrelatedACL.Match })
+		Expect(err).NotTo(HaveOccurred())
+		Expect(kept).To(HaveLen(1))
+		Expect(sw.ACLs).To(ContainElement(kept[0].UUID))
 		Expect(sw.OtherConfig).To(HaveKeyWithValue("dynamic-routing-vxlan-ifname", "evx4-fabric,evx6-fabric"))
 		Expect(sw.OtherConfig).To(HaveKeyWithValue(dynamicRoutingRedistribute, "fdb,ip"))
 		_, err = libovsdbops.GetLogicalSwitchPort(fakeOvn.nbClient, legacyPort)
@@ -141,6 +151,7 @@ var _ = Describe("OVN Multi-Homed pod operations for layer 2 network", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				var extraObjects []runtime.Object
+				podInfos := []testPod{podInfo}
 				nodes := []corev1.Node{*testNode}
 				if testConfig.withRemoteNode || testConfig.withRemotePod {
 					By("adding a remote node")
@@ -154,6 +165,7 @@ var _ = Describe("OVN Multi-Homed pod operations for layer 2 network", func() {
 					remotePod := newMultiHomedPod(remotePodInfo, netInfo)
 					remotePod.Spec.NodeName = "test-node2"
 					extraObjects = append(extraObjects, remotePod)
+					podInfos = append(podInfos, remotePodInfo)
 				}
 
 				var expectedNBData []libovsdbtest.TestData
@@ -168,6 +180,14 @@ var _ = Describe("OVN Multi-Homed pod operations for layer 2 network", func() {
 						udnEnnabledSvcAS4,
 					)
 					expectedNBData = append(expectedNBData, nodeIPsAS4, udnEnnabledSvcAS4)
+					controller := getNetworkControllerName(netInfo.netName)
+					ids := addresssetmanager.GetPodSelectorAddrSetDbIDs(&metav1.LabelSelector{}, &metav1.LabelSelector{}, nil, "", controller, true)
+					var podIPs []string
+					for _, p := range podInfos {
+						podIPs = append(podIPs, p.getNetworkPortInfo(netInfo.netName, netInfo.nadName).podIP)
+					}
+					podsAS, _ := addressset.GetTestDbAddrSets(ids, podIPs)
+					expectedNBData = append(expectedNBData, podsAS)
 				}
 
 				Expect(setupFakeOvnForLayer2Topology(fakeOvn, initialDB, netInfo, nodes, podInfo, pod, extraObjects...)).To(Succeed())

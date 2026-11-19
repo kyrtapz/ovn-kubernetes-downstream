@@ -103,3 +103,33 @@ func Test_getDenyARPAndNSOnMACVRF(t *testing.T) {
 		})
 	}
 }
+
+func TestMACVRFTransitACLs(t *testing.T) {
+	const (
+		v4Match = "(ip4.dst == $v4pods && ((tcp && ip4.src == $v4pods) || (icmp4 && icmp4.type == {3, 11, 12})))"
+		v6Match = "(ip6.dst == $v6pods && ((tcp && ip6.src == $v6pods) || (icmp6 && icmp6.type == {1, 2, 3, 4})))"
+	)
+	for _, tc := range []struct{ name, v4, v6, endpoints string }{
+		{"IPv4", "v4pods", "", v4Match},
+		{"IPv6", "", "v6pods", v6Match},
+		{"dual stack", "v4pods", "v6pods", v4Match + " || " + v6Match},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			acls := macVRFTransitACLs("controller", "handoff", tc.v4, tc.v6)
+			matches := map[string]string{
+				nbdb.ACLDirectionFromLport: "inport", nbdb.ACLDirectionToLport: "outport",
+			}
+			for _, acl := range acls {
+				field, ok := matches[acl.Direction]
+				want := fmt.Sprintf(`%s == "handoff" && !eth.mcast && (%s)`, field, tc.endpoints)
+				if !ok || acl.Match != want || acl.Action != nbdb.ACLActionAllowStateless || len(acl.Options) != 0 {
+					t.Errorf("unexpected %s ACL: match %q, action %q, options %v", acl.Direction, acl.Match, acl.Action, acl.Options)
+				}
+				delete(matches, acl.Direction)
+			}
+			if len(matches) != 0 {
+				t.Errorf("missing transit ACLs for %v", matches)
+			}
+		})
+	}
+}

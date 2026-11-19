@@ -12,9 +12,12 @@ import (
 
 	"github.com/vishvananda/netlink"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilnet "k8s.io/utils/net"
 
+	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/config"
 	libovsdbops "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/ops"
+	libovsdbutil "github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/libovsdb/util"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/nbdb"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/node/controllers/evpn"
 	"github.com/ovn-kubernetes/ovn-kubernetes/go-controller/pkg/types"
@@ -29,6 +32,8 @@ const (
 	// OVN requires an address on the EVPN router port. The isolated stitch
 	// switch resolves remote router MACs from EVPN, so a link-local IP suffices.
 	evpnStitchIPv4 = "169.254.255.1/32"
+
+	macVRFTransitACLPriority = 1
 )
 
 func nativeEVPNSwitchConfig(vtep string, vni int32, svi, advertisePort string) map[string]string {
@@ -58,11 +63,76 @@ func (oc *BaseLayer2UserDefinedNetworkController) syncMACVRFSwitch(sw *nbdb.Logi
 	}); err != nil {
 		return err
 	}
+	portName := util.GetMACVRFPortName(sw.Name)
 	if native {
-		legacyPort := &nbdb.LogicalSwitchPort{Name: util.GetMACVRFPortName(sw.Name)}
-		return libovsdbops.DeleteLogicalSwitchPorts(oc.nbClient, sw, legacyPort)
+		// Remove both transit ACLs and their host-facing port together on migration.
+		acls, err := libovsdbops.FindACLsWithPredicate(oc.nbClient, libovsdbops.GetPredicate[*nbdb.ACL](macVRFTransitACLIDs(oc.controllerName), nil))
+		if err != nil {
+			return err
+		}
+		ops, err := libovsdbops.RemoveACLsFromLogicalSwitchOps(oc.nbClient, nil, sw.Name, acls...)
+		if err != nil {
+			return err
+		}
+		ops, err = libovsdbops.DeleteLogicalSwitchPortsOps(oc.nbClient, ops, sw, &nbdb.LogicalSwitchPort{Name: portName})
+		if err != nil {
+			return err
+		}
+		_, err = libovsdbops.TransactAndCheck(oc.nbClient, ops)
+		return err
+	}
+	if config.Gateway.Mode == config.GatewayModeLocal && oc.IsPrimaryNetwork() {
+		// The empty selectors include workload IPs in every namespace on this
+		// network. Legacy network policy selection excludes host-network pods.
+		_, v4, v6, err := oc.addressSetManager.EnsureAddressSet(&metav1.LabelSelector{}, &metav1.LabelSelector{}, nil, "",
+			"MACVRFTransit/"+portName, oc.controllerName, oc.GetNetInfo(), true)
+		if err != nil {
+			return fmt.Errorf("ensuring pod address set for %s: %w", portName, err)
+		}
+		acls := macVRFTransitACLs(oc.controllerName, portName, v4, v6)
+		ops, err := libovsdbops.CreateOrUpdateACLsOps(oc.nbClient, nil, oc.GetSamplingConfig(), acls...)
+		if err != nil {
+			return err
+		}
+		ops, err = libovsdbops.AddACLsToLogicalSwitchOps(oc.nbClient, ops, sw.Name, acls...)
+		if err != nil {
+			return err
+		}
+		_, err = libovsdbops.TransactAndCheck(oc.nbClient, ops)
+		return err
 	}
 	return nil
+}
+
+func macVRFTransitACLIDs(controllerName string) *libovsdbops.DbObjectIDs {
+	return libovsdbops.NewDbObjectIDs(libovsdbops.ACLUDN, controllerName, map[libovsdbops.ExternalIDKey]string{
+		libovsdbops.ObjectNameKey: "MACVRFTransit",
+	})
+}
+
+// Both directions must select the same connections. Skipping only the output
+// lookup leaves the return SYN-ACK without state in the MAC-VRF port's zone.
+// A router can originate ICMP errors for these connections. Pass their errors
+// to the destination pod's CT zone, where the original connection and any
+// load-balancer translation exist.
+func macVRFTransitACLs(controllerName, portName, v4, v6 string) []*nbdb.ACL {
+	var endpoints []string
+	if v4 != "" {
+		endpoints = append(endpoints, fmt.Sprintf("(ip4.dst == $%[1]s && ((tcp && ip4.src == $%[1]s) || (icmp4 && icmp4.type == {3, 11, 12})))", v4))
+	}
+	if v6 != "" {
+		endpoints = append(endpoints, fmt.Sprintf("(ip6.dst == $%[1]s && ((tcp && ip6.src == $%[1]s) || (icmp6 && icmp6.type == {1, 2, 3, 4})))", v6))
+	}
+	match := fmt.Sprintf("%q && !eth.mcast && (%s)", portName, strings.Join(endpoints, " || "))
+	ids := macVRFTransitACLIDs(controllerName)
+	return []*nbdb.ACL{
+		libovsdbutil.BuildACLWithDefaultTier(ids.AddIDs(map[libovsdbops.ExternalIDKey]string{
+			libovsdbops.PolicyDirectionKey: string(libovsdbutil.ACLIngress),
+		}), macVRFTransitACLPriority, "outport == "+match, nbdb.ACLActionAllowStateless, nil, libovsdbutil.LportIngress),
+		libovsdbutil.BuildACLWithDefaultTier(ids.AddIDs(map[libovsdbops.ExternalIDKey]string{
+			libovsdbops.PolicyDirectionKey: string(libovsdbutil.ACLEgress),
+		}), macVRFTransitACLPriority, "inport == "+match, nbdb.ACLActionAllowStateless, nil, libovsdbutil.LportEgress),
+	}
 }
 
 func (gw *GatewayManager) usesNativeIPVRF() bool {
